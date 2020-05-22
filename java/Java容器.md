@@ -542,7 +542,7 @@ ArrayList基于动态数组实现，而LinkedList基于双线链表实现。Arra
 	    return h & (length-1);
 	}
 
-##### 扩容基本原理
+#### 扩容基本原理
 设HashMap的table的长度为M，需要存储的键值对数量为N，如果哈希函数满足均匀性的要求，那么每条链表的长度大约为N/M，因此查找的复杂度为O(N/M)。为了让查找成本降低，应该是N/M尽可能小，因此需要保证M尽可能的大，也就是说table要尽可能大。HashMap采用动态扩容来根据当前的N值来调整M值，是的空间效率和时间效率得到保证。
 
 和扩容有关的参数主要有：capacity、size、threshold和load_factor：
@@ -606,6 +606,7 @@ ArrayList基于动态数组实现，而LinkedList基于双线链表实现。Arra
 	            do {
 	                Entry<K,V> next = e.next;
 	                int i = indexFor(e.hash, newCapacity);
+					//头插法
 	                e.next = newTable[i];
 	                newTable[i] = e;
 	                e = next;
@@ -614,8 +615,186 @@ ArrayList基于动态数组实现，而LinkedList基于双线链表实现。Arra
 	    }
 	}
 
+#### 扩容重新计算桶下标
+在进行扩容时，需要把键值对重新计算桶下标，从而放在对应的桶上。HashMap使用hash%capacity来确定桶下标（确保capacity为2的n次方，便使用hash&(capacity-1)同等替换）。
+
+假设原数组长度capacity为16，扩容后new capacity为32：
+
+	capacity     : 00010000
+	new capacity : 00100000
+
+此时观察hash值的第5位，如果第5位为0，则桶位置和原来一样，如果为1，则在原位置加2^5=16。
+
+#### 计算数组容量
+HashMap构造函数允许用户传入的容量不是2的n次方，因为它可以自动地将传入的容量转换为2的n次方。
+
+现在存在一个定理： **大于某个数的最小的2的n次方，为此数的掩码加1** 。那么如果计算一个数的掩码呢，例如对于10010000，它的掩码是11111111，可以使用如下方法得到其掩码：
+
+	mask |= mask >> 1    11011000
+	mask |= mask >> 2    11111110
+	mask |= mask >> 4    11111111
+
+那么mask+1就是 **大于** 原始数据的最小2的n次方：
+
+	num     10010000
+	mask+1 100000000
+
+以下是HashMap中计算数组容量的代码：
+
+	static final int tableSizeFor(int cap) {
+	    int n = cap - 1;
+	    n |= n >>> 1;
+	    n |= n >>> 2;
+	    n |= n >>> 4;
+	    n |= n >>> 8;
+	    n |= n >>> 16;
+	    return (n < 0) ? 1 : (n >= MAXIMUM_CAPACITY) ? MAXIMUM_CAPACITY : n + 1;
+	}
+
+***Notice:*** tableSizeFor()函数一开始将cap-1，是因为如果不减一最终得到的是一个 **大于** cap的最小的2的n次方，首先将cap-1，就能够得到 **大于等于** cap的最小的2的n次方了。
+
+#### 链表转为红黑树
+从JDK 1.8开始，一个桶存储的链表长度大于等于8时将会将链表转为红黑树。
+
+#### 与HashTable的比较
+- HashTable使用synchronized来进行同步。
+- HashMap可以插入键为null的Entry。
+- HashMap的迭代器是fail-fast迭代器。
+- HashMap不能保证随着时间的推移Map中的元素次序是不变的。
+
+### ConcurrentHashMap
+#### 存储结构
+	static final class HashEntry<K,V> {
+	    final int hash;
+	    final K key;
+	    volatile V value;
+	    volatile HashEntry<K,V> next;
+	}
+
+ConcurrentHashMap和HashMap实现上类似，最主要的区别是ConcurrentHashMap采用了 **分段锁(Segment)** ，每个分段锁维护着几个桶(HashEntry)，多线程可以同时访问不同分段锁上的桶，从而使得其并发度更高（并发度就是Segment的个数）。
+
+Segment继承自ReentrantLock：
+
+	static final class Segment<K,V> extends ReentrantLock implements Serializable {
+	
+	    private static final long serialVersionUID = 2249069246763182397L;
+	
+	    static final int MAX_SCAN_RETRIES =
+	        Runtime.getRuntime().availableProcessors() > 1 ? 64 : 1;
+	
+	    transient volatile HashEntry<K,V>[] table;
+	
+	    transient int count;
+	
+	    transient int modCount;
+	
+	    transient int threshold;
+	
+	    final float loadFactor;
+	}
+
+默认的并发级别是16，也就是说默认创建16个Segment：
+
+	final Segment<K,V>[] segments;
+	static final int DEFAULT_CONCURRENCY_LEVEL = 16;
+
+![ConcurrentHashMap存储结构图][p7]
+
+#### size操作
+每个Segment维护一个count变量来统计该Segment中的键值对数目。
+
+	/**
+	 * The number of elements. Accessed only either within locks
+	 * or among other volatile reads that maintain visibility.
+	 */
+	transient int count;
+
+在执行size操作时，需要遍历所有的Segment然后把所有的count累计起来。ConcurrentHashMap在执行size操作的时候先尝试不加锁，如果连续两次不加锁操作得到modCount的结果一致，那么可以认为这个结果是正确的。尝试次数使用RETRIES_BEFORE_LOCK定义，该值为2，retries初始值为-1，因此尝试次数为3。如果尝试次数超过3次，就需要对每个Segment加锁。
 
 
+	/**
+	 * Number of unsynchronized retries in size and containsValue
+	 * methods before resorting to locking. This is used to avoid
+	 * unbounded retries if tables undergo continuous modification
+	 * which would make it impossible to obtain an accurate result.
+	 */
+	static final int RETRIES_BEFORE_LOCK = 2;
+	
+	public int size() {
+	    // Try a few times to get accurate count. On failure due to
+	    // continuous async changes in table, resort to locking.
+	    final Segment<K,V>[] segments = this.segments;
+	    int size;
+	    boolean overflow; // true if size overflows 32 bits
+	    long sum;         // sum of modCounts
+	    long last = 0L;   // previous sum
+	    int retries = -1; // first iteration isn't retry
+	    try {
+	        for (;;) {
+	            // 超过尝试次数，则对每个 Segment 加锁
+	            if (retries++ == RETRIES_BEFORE_LOCK) {
+	                for (int j = 0; j < segments.length; ++j)
+	                    ensureSegment(j).lock(); // force creation
+	            }
+	            sum = 0L;
+	            size = 0;
+	            overflow = false;
+	            for (int j = 0; j < segments.length; ++j) {
+	                Segment<K,V> seg = segmentAt(segments, j);
+	                if (seg != null) {
+	                    sum += seg.modCount;
+	                    int c = seg.count;
+	                    if (c < 0 || (size += c) < 0)
+	                        overflow = true;
+	                }
+	            }
+	            // 连续两次得到modCount的结果一致，则认为这个结果是正确的
+	            if (sum == last)
+	                break;
+	            last = sum;
+	        }
+	    } finally {
+	        if (retries > RETRIES_BEFORE_LOCK) {
+	            for (int j = 0; j < segments.length; ++j)
+	                segmentAt(segments, j).unlock();
+	        }
+	    }
+	    return overflow ? Integer.MAX_VALUE : size;
+	}
+
+#### JDK 1.8的改动
+- JDK 1.7使用分段锁机制实现并发更新操作，核心类为Segment，它继承自重入锁ReentrantLock，并发度和Segment数量相等。
+- JDK 1.8使用了CAS操作来支持更高的并发度，在CAS操作失败时使用内置锁synchronized。
+- JDK 1.8的实现也在链表过长时会转换为红黑树。
+
+### LinkedHashMap
+#### 存储结构
+继承自HashMap，因此具有和HashMap一样的快速查找特征：
+
+	public class LinkedHashMap<K,V> extends HashMap<K,V> implements Map<K,V>
+
+内部维护一个双向链表，用来维护插入顺序或者LRU顺序：
+
+	/**
+	 * The head (eldest) of the doubly linked list.
+	 */
+	transient LinkedHashMap.Entry<K,V> head;
+	
+	/**
+	 * The tail (youngest) of the doubly linked list.
+	 */
+	transient LinkedHashMap.Entry<K,V> tail;
+
+accessOrder决定了顺序，默认为false，此时维护的是插入顺序,否则维护的就是LRU顺序。
+
+	final boolean accessOrder;
+
+LinkedHashMap最重要的是以下用于维护顺序的函数，它们会在put、get等方法中调用。
+
+	void afterNodeAccess(Node<K,V> p) { }
+	void afterNodeInsertion(boolean evict) { }
+
+#### afterNodeAccess()
 
 
 
@@ -627,3 +806,4 @@ ArrayList基于动态数组实现，而LinkedList基于双线链表实现。Arra
 [p4]:./../media/20200513-2.png
 [p5]:./../media/20200513-3.png
 [p6]:./../media/20200513-4.png
+[p7]:./../media/20200514-1.png
